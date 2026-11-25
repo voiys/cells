@@ -20,7 +20,8 @@
 ;;;;
 ;;;; Two transports, as the Zig client had: stdio (a child process, newline
 ;;;; delimited JSON-RPC) and streamable HTTP (one POST per message, JSON or
-;;;; SSE reply). No reader thread: every read happens on the calling thread
+;;;; SSE reply). A session's ACP client may hand it servers of its own
+;;;; (session.lisp). No reader thread: every read happens on the calling thread
 ;;;; under that call's own deadline, which is also the whole cancellation
 ;;;; story — an eval thread is never interrupted by Esc, only by its deadline
 ;;;; or (eval-interrupt).
@@ -47,6 +48,7 @@
                (:file "http")
                (:file "tool-cache")
                (:file "registry")
+               (:file "session")
                (:file "surface")
                (:file "wrappers")
                (:file "primer")
@@ -64,6 +66,7 @@
                (:file "rpc-test")
                (:file "stdio-test")
                (:file "http-test")
+               (:file "session-test")
                (:file "oauth-test")
                (:file "reference-test")
                (:file "surface-test")

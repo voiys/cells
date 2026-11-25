@@ -23,6 +23,7 @@ Lisp client's contract needs to see:
   --instructions TEXT: initialize answers TEXT as the server's instructions
 """
 import json
+import os
 import sys
 import threading
 import time
@@ -105,6 +106,8 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "chatty", "description": "Prints an authorization address on stderr, answers anyway.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "token", "description": "Answers its FIXTURE_TOKEN variable.",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 # --sign-in: mcp-remote's way of signing in. The loopback listener takes the
@@ -164,7 +167,8 @@ def hold_for_sign_in():
 
 def catalog():
     tools = [tool for tool in TOOLS
-             if (tool["name"] != "sign_out" or SIGN_IN) and (tool["name"] != "chatty" or CHATTY)]
+             if (tool["name"] != "sign_out" or SIGN_IN) and (tool["name"] != "chatty" or CHATTY)
+             and (tool["name"] != "token" or "--more" in ARGS)]
     if changed:
         tools.append({"name": "echo2", "description": "The tool that appeared.",
                       "inputSchema": {"type": "object", "properties": {}}})
@@ -230,6 +234,8 @@ def handle_call(req):
         sys.stderr.flush()
         time.sleep(0.3)
         reply(req, {"content": [text("chatty answered")]})
+    elif name == "token":
+        reply(req, {"content": [text("token: %s" % os.environ.get("FIXTURE_TOKEN"))]})
     else:
         error(req, -32602, "unknown tool %r" % name)
 

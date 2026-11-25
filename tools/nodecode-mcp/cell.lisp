@@ -4,9 +4,13 @@
 ;;;;
 ;;;; The cell entry the loader finds by name: serve /api/mcp, read the `mcp'
 ;;;; section once, build the registry, start one connect thread per server,
-;;;; install the primer advice, register /mcp, return the stop thunk. Config
-;;;; is materialized here and closed over; a change the page makes is written
-;;;; to config.jsonc and read by the next start.
+;;;; install the primer advice, register /mcp, take the hook a session's
+;;;; servers arrive through (session.lisp) and advise the live sections with
+;;;; them, return the stop thunk. Config is materialized here and closed
+;;;; over; a change the page makes is written to config.jsonc and read by
+;;;; the next start. A start reads no session's servers back: they arrive
+;;;; through the hook alone, so a restart of this folder closes them until
+;;;; their client sets them again.
 ;;;;
 ;;;; Slash output: every subcommand answers one line, and none of them
 ;;;; blocks: the command runs on an HTTP worker of the gateway, so a restart
@@ -313,12 +317,30 @@ name is set under mcp.servers."
 
 ;;; --- the entry ------------------------------------------------------------
 
+(defun take-session-hook (on)
+  "Push SESSION-SERVERS-SET onto the core's session hooks (ON), or take it
+off; a core without them warns, once per start, that no session's servers
+reach this cell."
+  (let ((symbol (hooks-symbol)))
+    (cond (symbol
+           (if on
+               (pushnew 'session-servers-set (symbol-value symbol))
+               (setf (symbol-value symbol) (remove 'session-servers-set (symbol-value symbol)))))
+          (on (warn "mcp: this core hands no session's MCP servers to cells (no nle::*session-mcp-servers-hooks*)")))
+    (if on
+        (nle:hook 'nle::read-live-sections "nodecode-mcp" #'session-live-sections)
+        (nle:unhook 'nle::read-live-sections "nodecode-mcp"))))
+
 (defun stop-cell (&aux (registry *registry*))
-  "Undo START-CELL: the page's route, /mcp, every connection, the generated
-functions, the manual. Idempotent."
+  "Undo START-CELL: the page's route, /mcp, the session hook and every
+session's servers, every connection, the generated functions, the manual.
+Idempotent."
   (nle:route +route+ nil)
   (nle:unregister-commands "nodecode-mcp")
   (nle:route +catalog-route+ nil)
+  (take-session-hook nil)
+  (setf *running* nil)
+  (stop-session-servers)
   ;; A sign-in waiting on its browser closes its listener.
   (cancel-all-sign-ins)
   (when registry
@@ -356,6 +378,9 @@ register /mcp; the stop thunk takes it all down."
   (stop-cell)
   (nle:route +route+ #'servers-route)
   (nle:route +catalog-route+ #'catalog-route)
+  (setf *running* t)
+  (take-session-hook t)
+  (take-held-session-servers)
   (when (and section (nlk:config-boolean section "enabled" t))
     (let ((registry (make-registry-from-section section)))
       (when registry.servers

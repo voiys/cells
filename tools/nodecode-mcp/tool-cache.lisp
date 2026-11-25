@@ -34,28 +34,30 @@ never stands idle without them.")
 (defun save-tools (spec tools instructions)
   "Keep TOOLS as the catalog SPEC's server listed last, with INSTRUCTIONS, what
 its initialize said about using it (NIL for none). A failure warns and keeps
-nothing: the next boot connects that server instead."
-  (nlk:with-handlers ((error (condition)
-                        (warn "mcp ~a: its catalog could not be kept: ~a" spec.name condition)
-                        nil))
-    (nlk:write-file-atomically
-     (tool-cache-path spec.name)
-     (nlk:encode-json-object
-      (nlk:json-object "version" +tool-cache-version+
-                       "reached" (transport-text spec)
-                       "tools" (map 'vector (lambda (tool)
-                                              (nlk:json-object "name" (getf tool :name)
-                                                               "description" (getf tool :description)
-                                                               "inputSchema" (getf tool :schema)))
-                                    tools)
-                       :opt "instructions" instructions)))
-    t))
+nothing: the next boot connects that server instead. A session's server keeps
+nothing."
+  (unless spec.session-id
+    (nlk:with-handlers ((error (condition)
+                          (warn "mcp ~a: its catalog could not be kept: ~a" spec.name condition)
+                          nil))
+      (nlk:write-file-atomically
+       (tool-cache-path spec.name)
+       (nlk:encode-json-object
+        (nlk:json-object "version" +tool-cache-version+
+                         "reached" (transport-text spec)
+                         "tools" (map 'vector (lambda (tool)
+                                                (nlk:json-object "name" (getf tool :name)
+                                                                 "description" (getf tool :description)
+                                                                 "inputSchema" (getf tool :schema)))
+                                      tools)
+                         :opt "instructions" instructions)))
+      t)))
 
 (defun saved-tools (spec &aux (path (tool-cache-path spec.name)))
   "The catalog SPEC's server listed last, as tool plists, and the instructions
 kept with it as the second value; NIL when none is kept for the way SPEC
 reaches it."
-  (when (probe-file path)
+  (when (and (null spec.session-id) (probe-file path))
     (nlk:with-handlers ((error (condition)
                           (warn "mcp ~a: its kept catalog is unreadable: ~a" spec.name condition)
                           nil))

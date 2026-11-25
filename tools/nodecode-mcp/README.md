@@ -48,6 +48,32 @@ servers through `/api/mcp`, and its Catalog fills the form from
 `catalog.json`, a list of known servers whose recipes come from each
 project's own docs.
 
+## A session's own servers
+
+An ACP client may hand a session MCP servers of its own (T3 Code hands each
+thread its `t3-code` server: a command with a per-thread token in its env).
+The core holds them in memory and tells this cell each time a session's list
+is set, through `nle::*session-mcp-servers-hooks*`. A restart of this folder
+closes them and its start holds again every list the core still holds
+(`nle:session-mcp-server-sessions`). They live apart from
+the configured servers and only an evaluation in that session reaches them,
+ahead of a configured server of the same name:
+
+```lisp
+(mcp:call "t3-code" "t3_thread_list")   ; by name: no mcp:t3-code/... function is generated
+(mcp:tools "t3-code")                   ; connects it, lists its tools as calls by name
+```
+
+Each connects as soon as it is handed (ACP asks an agent to connect every
+server its client gives it), keeps no catalog, never signs in with
+OAuth, follows no HTTP redirect (its headers reach its own origin only),
+and logs its stderr to `session-SESSION--NAME.stderr.log`. Its env and
+header values are never shown in a status, an error or a log. The session
+reads a short `mcp-session` note naming them and their tools, which rides
+that session alone, so the prompt every session shares does not move. A
+list set again keeps a server reached the same way; one dropped or changed
+is closed.
+
 ## Config
 
 ```jsonc

@@ -72,6 +72,8 @@ Rules:
    MCP-TIMEOUT keeps the connection; retry once with a larger :timeout only if the tool is known to be slow.
 5. Inside a definition you keep (a defun), write (mcp:call \"server\" \"tool\" ...) rather than the
    generated name: the generated function exists only while its server is connected.
+6. A session's client may give it servers of its own (its mcp-session note names them): those are
+   reached by name, (mcp:call \"SERVER\" \"TOOL\" ...), never as a generated function.
 
 Catalog:"
   "The static half of the block.")

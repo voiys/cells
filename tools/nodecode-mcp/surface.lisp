@@ -202,18 +202,24 @@ tool whose folded name matches."
                             (member name required :test #'string=)))
                   (schema-properties schema))))
 
-(defun tool-line (server-name tool)
-  (format nil "(mcp:~(~a~)~@[ ~a~]) - ~a"
-          (or (getf tool :symbol) (tool-function-name server-name (getf tool :name)))
-          (let ((text (argument-text tool))) (and (plusp (length text)) text))
-          (nlk:one-line (getf tool :description) :cap 120)))
+(defun tool-line (server-name tool &key session)
+  "TOOL of SERVER-NAME as one line: the call form with its arguments and
+description; a SESSION server's form is MCP:CALL by name."
+  (let ((arguments (let ((text (argument-text tool))) (and (plusp (length text)) text)))
+        (about (nlk:one-line (getf tool :description) :cap 120)))
+    (format nil "~:[(mcp:~(~a~)~@[ ~a~])~*~;(mcp:call ~s ~s~@[ ~a~])~] - ~a"
+            session
+            (if session server-name (or (getf tool :symbol) (tool-function-name server-name (getf tool :name))))
+            (if session (getf tool :name) arguments)
+            (and session arguments)
+            about)))
 
 (defun state-line (snapshot)
   "One status line for a server snapshot."
-  (destructuring-bind (&key name state error tool-count transport server-info &allow-other-keys)
+  (destructuring-bind (&key name session-id state error tool-count transport server-info &allow-other-keys)
       snapshot
-    (format nil "~a: ~(~a~)~@[, ~d tool~:p~]~@[ (~a)~], ~a~@[, server ~a~]"
-            name state
+    (format nil "~a~:[~;, this session's~]: ~(~a~)~@[, ~d tool~:p~]~@[ (~a)~], ~a~@[, server ~a~]"
+            name session-id state
             (and (member state '(:ready :idle)) tool-count)
             (and error (nlk:one-line error :cap 200))
             transport
@@ -231,12 +237,16 @@ file header) and return the result as text."
   (check-type server-name string)
   (check-type tool-name string)
   (nlk:bind ((server (find-server server-name))
+             ((_ timeout) (build-arguments nil args))
+             (deadline (deadline-after (* 1000 (or timeout (/ (server-spec-timeout-ms server.spec) 1000)))))
+             ;; A server that never listed connects first, so the arguments resolve against its catalog.
+             (nil (ensure-catalog server deadline))
              ;; An idle server's catalog is the one it kept: the arguments resolve against it.
              (tool (and (member server.state '(:ready :idle))
                         (server-tool server tool-name)))
              (name (if tool (getf tool :name) tool-name))
-             ((arguments timeout limit) (build-arguments (and tool (getf tool :schema)) args))
-             (result (call-tool server name arguments :timeout-seconds timeout))
+             ((arguments _ limit) (build-arguments (and tool (getf tool :schema)) args))
+             (result (call-tool server name arguments :timeout-seconds timeout :deadline deadline))
              (text (clip (render-result result) (or limit *result-limit*))))
     (when (result-error-p result)
       (error 'mcp-tool-error :server server-name :tool name :detail text))
@@ -247,14 +257,23 @@ file header) and return the result as text."
 call form with its arguments, required ones starred, and the description."
   (let ((servers (if server-name
                      (list (find-server server-name))
-                     (registry-servers (running-registry)))))
-    (format nil "~{~a~^~%~}"
-            (loop for server in servers
-                  for snapshot = (server-snapshot server)
-                  collect (state-line snapshot)
-                  append (mapcar (lambda (tool)
-                                   (format nil "  ~a" (tool-line (server-name server) tool)))
-                                 (getf snapshot :tools))))))
+                     (visible-servers))))
+    ;; A session's server lists at its first use: this is one.
+    (dolist (server servers)
+      (when (session-server-p server)
+        (handler-case (ensure-catalog server (deadline-after (server-spec-timeout-ms server.spec)))
+          (mcp-error (condition)
+            (if server-name (error condition) nil)))))
+    (if (null servers)
+        "no MCP servers configured (mcp.servers in ~/.nodecode/config.jsonc), and none from this session's client"
+        (format nil "~{~a~^~%~}"
+                (loop for server in servers
+                      for snapshot = (server-snapshot server)
+                      collect (state-line snapshot)
+                      append (mapcar (lambda (tool)
+                                       (format nil "  ~a" (tool-line (server-name server) tool
+                                                                     :session (session-server-p server))))
+                                     (getf snapshot :tools)))))))
 
 (defun instructions (&optional server-name)
   "What every server (or SERVER-NAME's) said about using it and its tools in
@@ -262,22 +281,31 @@ its initialize answer, whole: its name on a line, then its words. One that
 said nothing, or has not been reached yet, says which."
   (let ((servers (if server-name
                      (list (find-server server-name))
-                     (registry-servers (running-registry)))))
-    (clip (format nil "~{~a~^~%~%~}"
-                  (loop for server in servers
-                        collect (destructuring-bind (&key name state tool-count instructions
-                                                     &allow-other-keys)
-                                    (server-snapshot server)
-                                  (cond (instructions (format nil "~a:~%~a" name instructions))
-                                        ((or (plusp tool-count) (member state '(:ready :idle)))
-                                         (format nil "~a: none given" name))
-                                        (t (format nil "~a: not reached yet (~(~a~)) - (mcp:status) says why"
-                                                   name state))))))
-          *result-limit*)))
+                     (visible-servers))))
+    ;; A session's server initializes at its first use: this is one.
+    (dolist (server servers)
+      (when (session-server-p server)
+        (handler-case (ensure-catalog server (deadline-after (server-spec-timeout-ms server.spec)))
+          (mcp-error (condition)
+            (if server-name (error condition) nil)))))
+    (if (null servers)
+        "no MCP servers configured (mcp.servers in ~/.nodecode/config.jsonc), and none from this session's client"
+        (clip (format nil "~{~a~^~%~%~}"
+                      (loop for server in servers
+                            collect (destructuring-bind (&key name state tool-count instructions
+                                                         &allow-other-keys)
+                                        (server-snapshot server)
+                                      (cond (instructions (format nil "~a:~%~a" name instructions))
+                                            ((or (plusp tool-count) (member state '(:ready :idle)))
+                                             (format nil "~a: none given" name))
+                                            (t (format nil "~a: not reached yet (~(~a~)) - (mcp:status) says why"
+                                                       name state))))))
+              *result-limit*))))
 
 (defun schema (server-name tool-name)
   "The full inputSchema of TOOL-NAME on SERVER-NAME, as JSON text."
-  (let* ((server (find-server server-name))
+  (let* ((server (ensure-catalog (find-server server-name)
+                                 (deadline-after (server-spec-timeout-ms (server-spec (find-server server-name))))))
          (tool (or (server-tool server tool-name)
                    (error 'mcp-unknown-tool
                           :detail (format nil "~a has no catalog yet (~(~a~))"
@@ -287,7 +315,7 @@ said nothing, or has not been reached yet, says which."
 (defun status ()
   "One line per configured server: state, tool count, transport (a header
 count, never a value), the last error and the stderr log of a process."
-  (nlk:if-let (servers (registry-servers (running-registry)))
+  (nlk:if-let (servers (visible-servers))
     (format nil "~{~a~^~%~}"
             (loop for server in servers
                   for snapshot = (server-snapshot server)
@@ -295,12 +323,14 @@ count, never a value), the last error and the stderr log of a process."
                                   (state-line snapshot)
                                   (getf snapshot :sign-in)
                                   (getf snapshot :log-path))))
-    "no MCP servers configured (mcp.servers in ~/.nodecode/config.jsonc)"))
+    "no MCP servers configured (mcp.servers in ~/.nodecode/config.jsonc), and none from this session's client"))
 
 (defun sign-in-server (server-name &aux (server (find-server server-name)) (spec server.spec))
   "SERVER-NAME's server, once it signs in with OAuth; else the refusal
 saying why it does not."
-  (cond ((not (eq spec.transport :http))
+  (cond (spec.session-id
+         (fail "~a is this session's client's server: its client signs it in" server-name))
+        ((not (eq spec.transport :http))
          (fail "~a is a stdio server: it signs in through its own command" server-name))
         ((eq spec.oauth :off)
          (fail "~a says oauth: false in config.jsonc" server-name))
@@ -319,7 +349,8 @@ the sign-in finishing on its own once the browser comes back and the server
 then connecting. With ADDRESS -- the address the browser landed on, pasted
 back from another machine -- finish the sign-in in progress."
   (check-type server-name string)
-  (when (eq (server-spec-transport (server-spec (find-server server-name))) :stdio)
+  (when (and (eq (server-spec-transport (server-spec (find-server server-name))) :stdio)
+             (null (server-spec-session-id (server-spec (find-server server-name)))))
     (return-from login (command-login (find-server server-name) address)))
   (let ((server (sign-in-server server-name)))
     (handler-case

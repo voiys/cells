@@ -19,6 +19,9 @@
 ;;;; mcp:files/read-file at boot before any server has connected — the
 ;;;; primer still tells it to prefer (mcp:call ...) inside definitions it
 ;;;; keeps, since the function itself exists only while the server does.
+;;;;
+;;;; A session's server (session.lisp) gets none: a symbol in this package
+;;;; is every session's, and its server is one session's alone.
 
 (in-package #:nodecode-mcp)
 
@@ -101,7 +104,9 @@ the round trip it makes. Compiled where the image carries no interpreter."
                                         (tools '()))
   "Bring the generated functions in line with SERVER's catalog: define one
 per tool (noting its symbol on the tool plist), forget the ones whose
-tools are gone."
+tools are gone. A session's server has none."
+  (when (session-server-p server)
+    (return-from sync-tool-functions '()))
   (dolist (tool server.tools)
     (let ((symbol (intern (unique-function-name server-name (getf tool :name) taken)
                           :nodecode-mcp)))

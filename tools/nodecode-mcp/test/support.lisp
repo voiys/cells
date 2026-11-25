@@ -51,17 +51,28 @@
 (defmacro with-mcp-log-dir (&body body)
   "BODY with the stderr logs under a fresh temp directory; registry variables restored."
   `(with-temp-directory (directory "mcp-logs")
-     (with-saved-globals (mcp::*log-directory* mcp::*registry* nle::*help-topics*
-                          nle::*registered-commands* nle:*hooks*)
+     (with-saved-globals (mcp::*log-directory* mcp::*registry* mcp::*running* nle::*help-topics*
+                          nle::*registered-commands* nle:*hooks* nle::*session-mcp-servers-hooks*)
        (setf mcp::*log-directory* directory)
        ,@body)))
 
+(defun mcp-forget-held-session-servers ()
+  "Empty the core's table of session MCP servers: a start reads it back, so
+one test's sessions would otherwise start in the next."
+  (let ((table (find-symbol "*SESSION-MCP-SERVERS*" '#:nodecode.evolved)))
+    (when (and table (boundp table))
+      (clrhash (symbol-value table)))))
+
 (defmacro with-mcp-cell ((&rest config-forms) &body body)
-  "START-CELL over a config built from CONFIG-FORMS (name entry pairs);
-stop on unwind; registry variables restored. STOP is bound to the thunk."
+  "START-CELL over a config built from CONFIG-FORMS (name entry pairs), the
+core holding no session's servers before and after; stop on unwind; registry
+variables restored. STOP is bound to the thunk."
   `(with-mcp-log-dir
-     (with-cell-stop ((mcp:start-cell (mcp-config ,@config-forms)))
-       ,@body)))
+     (mcp-forget-held-session-servers)
+     (unwind-protect
+          (with-cell-stop ((mcp:start-cell (mcp-config ,@config-forms)))
+            ,@body)
+       (mcp-forget-held-session-servers))))
 
 (defmacro with-ready-mcp ((name entry) &body body)
   "WITH-MCP-CELL over the one server NAME configured by ENTRY, BODY run
@@ -244,3 +255,14 @@ tests; NLE:STOP-CLACK-HANDLER on the fixture's handler takes it down."
   "An http entry pointing at FIXTURE, with extra PAIRS."
   (apply #'mcp-entry "url" (format nil "http://127.0.0.1:~d/mcp" fixture.port)
          "timeout_ms" 3000 pairs))
+
+(defun mcp-acp-server (name &rest flags)
+  "A stdio session server in ACP's McpServer shape running the fixture with
+FLAGS, FIXTURE_TOKEN in its env."
+  (nlk:json-object "name" name
+                   "command" "python3"
+                   "args" (coerce (cons (namestring (asdf:system-relative-pathname
+                                                     "nodecode-mcp" "test/fixture-server.py"))
+                                        (cons "--more" flags))
+                                  'vector)
+                   "env" (vector (nlk:json-object "name" "FIXTURE_TOKEN" "value" "sekrit-token-1"))))

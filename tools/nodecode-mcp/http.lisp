@@ -25,7 +25,9 @@
 ;;;; for.
 ;;;;
 ;;;; Header values are secrets and never appear in a condition: a failed
-;;;; status reports the code only.
+;;;; status reports the code only. A transport that is ORIGIN-ONLY (a
+;;;; session's server, whose headers are its client's) follows no redirect,
+;;;; so its headers never reach another origin.
 ;;;;
 ;;;; A transport with an OAUTH-BINDING (oauth.lisp) sends the kept access
 ;;;; token as Authorization: Bearer, refreshed when it is about to expire.
@@ -44,6 +46,7 @@
   (oauth nil)                           ; an OAUTH-BINDING, or NIL
   session-id
   protocol-version
+  (origin-only nil)                     ; follow no redirect
   (pending '() :type list)              ; decoded messages not yet received
   (closed-p nil))
 
@@ -153,14 +156,17 @@ response carries its answer; a notification's or a reply's gets 202 and no body.
                          (ignore-errors (close stream :abort t))))
       (handler-case
           (multiple-value-bind (body status headers)
-              (dex:post transport.url
-                        :headers (request-headers transport token)
-                        :content text
-                        :want-stream awaited
-                        :use-connection-pool nil
-                        :keep-alive nil
-                        :connect-timeout (min 10 timeout)
-                        :read-timeout timeout)
+              ;; DEX:POST takes no redirect limit; its REQUEST does.
+              (dex:request transport.url
+                           :method :post
+                           :headers (request-headers transport token)
+                           :content text
+                           :want-stream awaited
+                           :max-redirects (if transport.origin-only 0 5)
+                           :use-connection-pool nil
+                           :keep-alive nil
+                           :connect-timeout (min 10 timeout)
+                           :read-timeout timeout)
             (setf stream body)
             (if awaited
                 (consume-response transport status headers body)

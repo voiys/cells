@@ -119,7 +119,7 @@ since the last look; whole lines only, so an address half written waits."
 (defun start-stdio (spec allowlist)
   "Launch SPEC's command; a STDIO-TRANSPORT, or TRANSPORT-CLOSED naming why
 (REFERENCE-UNRESOLVED, before any launch, for an env reference that names nothing)."
-  (let ((log-path (stderr-log-path spec.name)) (argv (cons spec.command spec.args))
+  (let ((log-path (stderr-log-path spec)) (argv (cons spec.command spec.args))
         (environment (child-environment spec allowlist)) (mark 0))
     (handler-case
         (progn

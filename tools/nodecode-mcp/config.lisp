@@ -65,9 +65,20 @@
   (timeout-ms +default-timeout-ms+ :type integer)
   (enabled-p t)
   (lazy-p t)                          ; started by its first call when a catalog is kept
-  (refusal nil))                      ; config-refusal text, or NIL
+  (refusal nil)                       ; config-refusal text, or NIL
+  (session-id nil)                    ; the session whose client handed it over (session.lisp), or NIL
+  (literal-p nil))                    ; env and header values are values, never references
 
 (nlk:access (spec server-spec))
+
+;;; A spec holds env and header values, or references to them: printed, it
+;;; shows how the server is reached and a count of each, never one of them.
+(defmethod print-object ((spec server-spec) stream)
+  (print-unreadable-object (spec stream :type t :identity t)
+    (format stream "~a~@[ of session ~a~] ~a~@[ (~d env)~]"
+            (server-spec-name spec) (server-spec-session-id spec)
+            (if (server-spec-refusal spec) "refused" (ignore-errors (transport-text spec)))
+            (let ((count (length (server-spec-env spec)))) (and (plusp count) count)))))
 
 (defun string-alist (section key)
   "KEY's object as ((name . value) ...) with string values, or '() when absent."
@@ -306,8 +317,16 @@ own validation, and the env allowlist."
          allowlist))
       (values '() +default-inherit-env+)))
 
-(defun child-environment (spec allowlist
-                          &aux (env (resolved-alist spec.env "env" :one-line nil)))
+(defun spec-alist (spec key)
+  "SPEC's env (KEY \"env\") or headers (\"headers\") as the values a connect
+sends: a session server's as its client gave them, a configured one's with
+every reference resolved."
+  (let ((alist (if (string= key "env") spec.env spec.headers)))
+    (if spec.literal-p
+        alist
+        (resolved-alist alist key :one-line (string= key "headers")))))
+
+(defun child-environment (spec allowlist &aux (env (spec-alist spec "env")))
   "The child's whole environment as \"NAME=VALUE\" strings: the allowlisted
 variables that exist here (exported shell functions, the \"() {\" values,
 skipped as the reference SDK skips them), then the entry's env on top, its
@@ -320,8 +339,20 @@ references resolved."
                           collect (cons name value))
                   env)))
 
-(defun stderr-log-path (name)
-  (merge-pathnames (format nil "~a.stderr.log" name) *log-directory*))
+(defun file-stem (spec-or-name)
+  "The stem of a configured server's files, its name; a session server's
+carries its session id ahead of it, both folded to what a file name holds."
+  (flet ((safe (text)
+           (substitute-if-not #\_ (lambda (char) (or (alphanumericp char) (find char "-_."))) text)))
+    (if (and (server-spec-p spec-or-name) (server-spec-session-id spec-or-name))
+        (format nil "session-~a--~a" (safe (server-spec-session-id spec-or-name))
+                (safe (server-spec-name spec-or-name)))
+        (safe (if (server-spec-p spec-or-name) (server-spec-name spec-or-name) spec-or-name)))))
+
+(defun stderr-log-path (spec-or-name)
+  "Where the process of SPEC-OR-NAME -- a spec, or a configured server's name
+-- writes its stderr."
+  (merge-pathnames (format nil "~a.stderr.log" (file-stem spec-or-name)) *log-directory*))
 
 (defun transport-text (spec)
   "The transport for a status line: the command or the url, a header count
@@ -338,3 +369,69 @@ Authorization header of its own and does not say oauth: false."
   (and (eq spec.transport :http)
        (not (eq spec.oauth :off))
        (not (assoc "authorization" spec.headers :test #'string-equal))))
+
+;;; --- a session's servers ------------------------------------------------------
+;;; An ACP client hands a session its own servers (session.lisp) in ACP's
+;;; McpServer shape, passed through by the core unchanged:
+;;;
+;;;   {"name": S, "command": S, "args": [S...], "env": [{"name": S, "value": S}...]}
+;;;   {"type": "http", "name": S, "url": S, "headers": [{"name": S, "value": S}...]}
+;;;
+;;; Its env and header values are the client's own secrets, carried as they
+;;; are (LITERAL-P): no reference is read in them, and no refusal, status or
+;;; log line quotes one. It never signs in with OAuth here, and keeps nothing
+;;; on disk but its stderr log.
+
+(defun pair-alist (pairs key)
+  "PAIRS, ACP's [{name, value}...] under KEY, as ((name . value) ...)."
+  (cond ((or (null pairs) (eq pairs :null)) '())
+        ((not (and (vectorp pairs) (not (stringp pairs))))
+         (nlk:config-error "~a must be an array of {name, value}" key))
+        (t (loop for pair across pairs
+                 for name = (nlk:json-value pair :text "name")
+                 for value = (nlk:json-value pair :string "value")
+                 unless (and name value)
+                   do (nlk:config-error "every ~a entry needs a name and a string value" key)
+                 collect (cons name value)))))
+
+(defun parse-session-entry (session-id entry)
+  "A SERVER-SPEC for ENTRY, one of SESSION-ID's servers in ACP's shape, or
+one carrying the refusal text."
+  (let ((name (nlk:json-value entry :text "name")))
+    (nlk:with-handlers ((nlk:config-refusal (condition)
+                          (make-server-spec :name (or name "?") :session-id session-id :literal-p t
+                                            :enabled-p nil :refusal (princ-to-string condition))))
+      (unless (hash-table-p entry)
+        (nlk:config-error "a session server must be an object"))
+      (unless name
+        (nlk:config-error "a session server needs a name"))
+      (let ((type (or (nlk:json-value entry :string "type") "stdio")))
+        (cond
+          ((string-equal type "stdio")
+           (let ((command (nlk:json-value entry :text "command"))
+                 (args (nlk:json-value entry :array "args")))
+             (unless command
+               (nlk:config-error "session server ~a: stdio needs a command" name))
+             (unless (every #'stringp (or args #()))
+               (nlk:config-error "session server ~a: args must be strings" name))
+             (make-server-spec :name name :session-id session-id :literal-p t :transport :stdio
+                               :command command :args (coerce (or args #()) 'list)
+                               :env (pair-alist (gethash "env" entry) "env")
+                               :oauth :off :lazy-p nil)))
+          ((string-equal type "http")
+           (let ((url (nlk:json-value entry :text "url")))
+             (unless (and url (or (uiop:string-prefix-p "http://" url) (uiop:string-prefix-p "https://" url)))
+               (nlk:config-error "session server ~a: http needs an http(s) url" name))
+             (make-server-spec :name name :session-id session-id :literal-p t :transport :http
+                               :url url :headers (pair-alist (gethash "headers" entry) "headers")
+                               :oauth :off :lazy-p nil)))
+          (t (nlk:config-error "session server ~a: transport ~a is not one this client speaks (stdio, http)"
+                               name type)))))))
+
+(defun same-reach-p (one other)
+  "Whether the specs ONE and OTHER reach the same server the same way, every
+env and header value included."
+  (and (eq (server-spec-transport one) (server-spec-transport other))
+       (every (lambda (read) (equal (funcall read one) (funcall read other)))
+              (list #'server-spec-name #'server-spec-command #'server-spec-args #'server-spec-env
+                    #'server-spec-url #'server-spec-headers #'server-spec-refusal))))

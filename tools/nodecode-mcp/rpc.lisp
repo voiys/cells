@@ -36,7 +36,11 @@
 (defparameter +max-list-pages+ 16
   "tools/list pages followed before the catalog is taken as complete.")
 (defparameter +max-tools-per-server+ 64
-  "Tools kept per server; the rest are dropped with one warning.")
+  "Tools kept per configured server, whose every tool is a function and a
+line of the manual; the rest are dropped with one warning.")
+(defparameter +max-tools-per-session-server+ 256
+  "Tools kept per session's server, which is reached by name and adds nothing
+to the manual.")
 
 ;;; --- internal conditions --------------------------------------------------
 
@@ -99,6 +103,7 @@ seconds."))
 (nlk:define-record (client (:copier nil))
   "One connection: its transport and the request counter."
   transport
+  (tool-cap +max-tools-per-server+)     ; tools a listing keeps
   (next-id 0 :type integer)
   (list-changed-p nil)
   (stale-count 0 :type integer)
@@ -233,9 +238,9 @@ to +MAX-LIST-PAGES+ pages and keeping +MAX-TOOLS-PER-SERVER+ entries."
                              for tool = (tool-plist object)
                              when tool collect tool)
                 until (or (null next) (>= pages +max-list-pages+)))))
-    (when (> (length tools) +max-tools-per-server+)
+    (when (> (length tools) client.tool-cap)
       (warn "mcp: keeping ~d of ~d tools (the cap)"
-            +max-tools-per-server+ (length tools))
-      (setf tools (subseq tools 0 +max-tools-per-server+)))
+            client.tool-cap (length tools))
+      (setf tools (subseq tools 0 client.tool-cap)))
     (setf client.list-changed-p nil)
     tools))

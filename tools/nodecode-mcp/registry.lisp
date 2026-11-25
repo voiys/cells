@@ -64,11 +64,23 @@ fails, saying the sign-in still waits.")
 ;;; DEFVAR: a
 ;;; reload of this file mid-serve must not forget running children.
 (defvar *registry* nil
-  "The live registry, or NIL when the cell is not running.")
+  "The live registry, or NIL when the cell is not running or names no server.")
 
-(defun running-registry ()
-  "The live registry, or a refusal while the cell is not running."
-  (or *registry* (fail "the MCP cell is not running")))
+(defvar *running* nil
+  "True between START-CELL and its stop.")
+
+(defvar *session-servers* (make-hash-table :test #'equal :synchronized t)
+  "Session id -> the SERVERs its client handed it (session.lisp), in its order.")
+
+(defun session-servers (&optional (session-id nlk:*scribe-session-id*))
+  "The servers SESSION-ID's client handed it, NIL for none or no session."
+  (and session-id (values (gethash session-id *session-servers*))))
+
+(defun visible-servers (&optional (session-id nlk:*scribe-session-id*))
+  "Every server an evaluation in SESSION-ID reaches: its session's first,
+then the configured ones; a refusal while the cell is not running."
+  (unless *running* (fail "the MCP cell is not running"))
+  (append (session-servers session-id) (and *registry* (registry-servers *registry*))))
 
 ;;; --- state ----------------------------------------------------------------
 
@@ -86,12 +98,13 @@ fails, saying the sign-in still waits.")
   (bt2:with-lock-held ((server-state-lock server))
     (let ((spec server.spec))
       (list :name spec.name
+            :session-id spec.session-id
             :state server.state
             :error server.error-text
             :tool-count (length server.tools)
             :tools server.tools
             :transport (transport-text spec)
-            :log-path (when (eq spec.transport :stdio) (namestring (stderr-log-path spec.name)))
+            :log-path (when (eq spec.transport :stdio) (namestring (stderr-log-path spec)))
             :timing server.timing
             :sign-in (getf server.sign-in :url)
             :instructions server.instructions
@@ -113,24 +126,32 @@ fails, saying the sign-in still waits.")
 (defun registry-server-names (&optional (registry *registry*))
   (and registry (mapcar #'server-name registry.servers)))
 
-(defun find-server (name)
-  "The server called NAME, or MCP-UNKNOWN-SERVER naming the configured ones."
-  (or (find name (registry-servers (running-registry)) :key #'server-name :test #'string=)
-      (error 'mcp-unknown-server
-             :detail (format nil "no MCP server named ~s; configured: ~{~a~^, ~}"
-                             name (or (registry-server-names) '("none"))))))
+(defun find-server (name &optional (session-id nlk:*scribe-session-id*))
+  "The server called NAME -- SESSION-ID's own first, then a configured one --
+or MCP-UNKNOWN-SERVER naming the ones there are."
+  (let ((servers (visible-servers session-id)))
+    (or (find name servers :key #'server-name :test #'string=)
+        (error 'mcp-unknown-server
+               :detail (format nil "no MCP server named ~s; there are: ~{~a~^, ~}"
+                               name (or (mapcar #'server-name servers) '("none")))))))
+
+(defun session-server-p (server)
+  "Whether SERVER is a session's, handed over by its client."
+  (and (server-spec-session-id server.spec) t))
 
 ;;; --- connect --------------------------------------------------------------
 
 (defun open-client (spec allowlist)
   "A client over a fresh transport to SPEC -- its process started, or its URL
 named -- with nothing said on it yet."
-  (make-client :transport (ecase spec.transport
+  (make-client :tool-cap (if spec.session-id +max-tools-per-session-server+ +max-tools-per-server+)
+               :transport (ecase spec.transport
                             (:stdio (start-stdio spec allowlist))
                             (:http (make-http-transport
                                     :url spec.url
-                                    :headers (resolved-alist spec.headers "headers")
-                                    :oauth (spec-binding spec))))))
+                                    :headers (spec-alist spec "headers")
+                                    :origin-only (and spec.session-id t)
+                                    :oauth (and (null spec.session-id) (spec-binding spec)))))))
 
 (defun elapsed-ms (from to)
   "The whole milliseconds between two NOW-SECONDS readings."
@@ -159,7 +180,7 @@ to answer the handshake (a process's start-up inside it) and how long to list."
   "CONDITION's text, with the stderr log named for a process."
   ;; A reference that names nothing failed before any process started: no log to read.
   (if (and (eq spec.transport :stdio) (not (typep condition 'reference-unresolved)))
-      (let ((detail (princ-to-string condition)) (log (namestring (stderr-log-path spec.name))))
+      (let ((detail (princ-to-string condition)) (log (namestring (stderr-log-path spec))))
         (if (search log detail) detail (format nil "~a; see ~a" detail log)))
       (princ-to-string condition)))
 
@@ -290,19 +311,24 @@ Call with SERVER's call lock held."
     (rpc-timeout () nil)
     (awaits-sign-in (condition) (note-sign-in server condition) nil)))
 
-(defun spawn-connect (server)
-  "Connect SERVER on its own short-lived thread."
+(defun spawn-connect (server &key unless-ready)
+  "Connect SERVER on its own short-lived thread; UNLESS-READY skips the
+connect if another call already brought SERVER ready (or stopped it) before
+this thread took its lock."
   ;; Returns the thread, or NIL when the registry is stopping or the server
   ;; cannot connect at all.
-  (when (and *registry*
-             (not (registry-stopping-p *registry*))
+  (when (and *running*
+             (not (and *registry* (registry-stopping-p *registry*)))
              (not (member server.state '(:disabled :refused :stopped))))
     (let ((name (server-name server))
           (lock server.call-lock)
           (timeout (/ (server-spec-timeout-ms server.spec) 1000)))
       (nlk:spawn (format nil "mcp-connect-~a" name)
         ;; WITH-LOCK-HELD runs nothing and answers NIL when the lock does not come in time.
-        (unless (bt2:with-lock-held (lock :timeout timeout) (connect-locked server) t)
+        (unless (bt2:with-lock-held (lock :timeout timeout)
+                  (unless (and unless-ready (member server.state '(:ready :stopped :disabled :refused)))
+                    (connect-locked server))
+                  t)
           (warn "mcp ~a: busy, connect skipped" name))))))
 
 (defun drop-connection (server detail)
@@ -314,40 +340,67 @@ the model last saw (its functions answer MCP-OFFLINE until a reconnect)."
 
 ;;; --- the call -------------------------------------------------------------
 
-(defun call-tool (server tool-name arguments &key timeout-seconds)
+(defun ready-client (server deadline)
+  "SERVER's live client, connected -- once, inside DEADLINE -- when it is not
+ready; MCP-OFFLINE when it cannot be. Call with SERVER's call lock held."
+  (flet ((offline (detail)
+           (error 'mcp-offline :server (server-name server) :detail detail)))
+    (case server.state
+      (:ready server.client)
+      ((:error :disconnected :idle :connecting)
+       (cond ((pending-sign-in-p server)
+              (if (resume-sign-in server deadline)
+                  server.client
+                  (offline (sign-in-text server))))
+             ((connect-locked server :deadline deadline) server.client)
+             ((pending-sign-in-p server) (offline (sign-in-text server)))
+             (t (offline (or server.error-text "connect failed")))))
+      (:disabled (offline "disabled in config (enabled: false)"))
+      (:refused (offline (or server.error-text "refused config")))
+      (:stopped (offline "the cell is stopped"))
+      (t (offline (format nil "state ~a" server.state))))))
+
+(defun take-call-lock (server deadline)
+  "SERVER's call lock, taken before DEADLINE, or MCP-TIMEOUT."
+  (unless (bt2:acquire-lock server.call-lock :timeout (seconds-remaining deadline))
+    (error 'mcp-timeout :server (server-name server)
+                        :detail "still connecting (or busy with another call); retry")))
+
+(defun ensure-connected (server deadline &key unless-listed)
+  "Connect SERVER, inside DEADLINE, when it is not ready -- or, UNLESS-LISTED,
+only when it has no catalog yet, as a session's server before its first use,
+so its tools' arguments are known. => SERVER."
+  (unless (or (member server.state '(:ready :disabled :refused :stopped))
+              (and unless-listed server.tools))
+    (take-call-lock server deadline)
+    (nlk:with-cleanup ((bt2:release-lock server.call-lock))
+      (handler-case (ready-client server deadline)
+        (mcp-error (condition) (error condition))
+        (awaits-sign-in (condition)
+          (note-sign-in server condition)
+          (error 'mcp-offline :server (server-name server) :detail (sign-in-text server))))))
+  server)
+
+(defun ensure-catalog (server deadline)
+  "ENSURE-CONNECTED for a server that has no catalog yet. => SERVER."
+  (ensure-connected server deadline :unless-listed t))
+
+(defun call-tool (server tool-name arguments &key timeout-seconds deadline)
   "tools/call on SERVER: the raw result object."
   ;; The whole sequence runs under the call lock against one deadline; every
   ;; failure maps to the MCP-* family the model reads.
   (let* ((name (server-name server))
          (seconds (or timeout-seconds (/ (server-spec-timeout-ms server.spec) 1000)))
-         (deadline (deadline-after (* 1000 seconds)))
+         (deadline (or deadline (deadline-after (* 1000 seconds))))
          (lock server.call-lock)
          (phase :idle))
-    (unless (bt2:acquire-lock lock :timeout (seconds-remaining deadline))
-      (error 'mcp-timeout :server name
-                          :detail "still connecting (or busy with another call); retry"))
+    (take-call-lock server deadline)
     (nlk:with-cleanup ((when (eq phase :writing)
                          (ignore-errors (drop-connection server "interrupted while writing a frame")))
                        (bt2:release-lock lock))
       (prog1
           (handler-case
-              (let* (;; A ready server's client, after one reconnect for one that fell over.
-                     (client (flet ((offline (detail)
-                                      (error 'mcp-offline :server name :detail detail)))
-                               (case server.state
-                                 (:ready server.client)
-                                 ((:error :disconnected :idle :connecting)
-                                  (cond ((pending-sign-in-p server)
-                                         (if (resume-sign-in server deadline)
-                                             server.client
-                                             (offline (sign-in-text server))))
-                                        ((connect-locked server :deadline deadline) server.client)
-                                        ((pending-sign-in-p server) (offline (sign-in-text server)))
-                                        (t (offline (or server.error-text "connect failed")))))
-                                 (:disabled (offline "disabled in config (enabled: false)"))
-                                 (:refused (offline (or server.error-text "refused config")))
-                                 (:stopped (offline "the cell is stopped"))
-                                 (t (offline (format nil "state ~a" server.state))))))
+              (let* ((client (ready-client server deadline))
                      (params (nlk:json-object "name" tool-name
                                               "arguments" (or arguments (nlk:make-json-object)))))
                 (setf phase :writing)
@@ -417,7 +470,7 @@ TOOLS LIST-MS), the listing's own milliseconds."
   "Where SPEC's stderr log ends now, in octets, which LOG-SINCE reads after;
 NIL for a server that is not a process."
   (when (eq spec.transport :stdio)
-    (or (ignore-errors (with-open-file (in (stderr-log-path spec.name) :element-type '(unsigned-byte 8))
+    (or (ignore-errors (with-open-file (in (stderr-log-path spec) :element-type '(unsigned-byte 8))
                          (file-length in)))
         0)))
 
@@ -426,7 +479,7 @@ NIL for a server that is not a process."
 the launch stamps this cell writes left out -- or NIL when it wrote none."
   (let* ((text (and mark
                     (ignore-errors
-                     (with-open-file (in (stderr-log-path spec.name) :element-type '(unsigned-byte 8))
+                     (with-open-file (in (stderr-log-path spec) :element-type '(unsigned-byte 8))
                        (file-position in mark)
                        (let ((octets (make-array (- (file-length in) mark) :element-type '(unsigned-byte 8))))
                          (read-sequence octets in)

@@ -1,0 +1,125 @@
+;;;; session-test.lisp --- the servers a session's client hands it.
+;;;;
+;;;; SPDX-License-Identifier: MIT
+;;;;
+;;;; The core's half (NLE:SET-SESSION-MCP-SERVERS and its hooks) hands the
+;;;; specs over; these drive it directly, as the ACP agent and the gateway
+;;;; do, and evaluate as a session's eval does, with NLK:*SCRIBE-SESSION-ID*
+;;;; bound.
+
+(in-package #:nodecode.test)
+
+(defmacro in-session ((session-id) &body body)
+  "BODY evaluated as the session SESSION-ID's eval runs a form."
+  `(let ((nlk:*scribe-session-id* ,session-id)) ,@body))
+
+(defun mcp-session-server (session-id name)
+  (find name (mcp::session-servers session-id) :key #'mcp::server-name :test #'string=))
+
+(defun mcp-session-section (session-id)
+  (cdr (assoc "mcp-session" (nle::read-live-sections session-id) :test #'equal)))
+
+(deftest mcp-cell-session-servers-are-the-session-s-own (with-mcp-cell ())
+  (is (member 'mcp::session-servers-set nle::*session-mcp-servers-hooks*) "the cell takes the hook at start")
+  (nle:set-session-mcp-servers "s-a" (list (mcp-acp-server "t3")))
+  (let ((server (mcp-session-server "s-a" "t3")))
+    (is (await (:timeout 15) (eq :ready (mcp::server-state server))) "it connects as soon as it is handed"))
+  (in-session ("s-a")
+    (is (equal "token: sekrit-token-1" (mcp:call "t3" "token")) "its env passed")
+    (is (uiop:string-prefix-p "echo: per page" (mcp:call "t3" "echo" :message "per page" :per-page 2)) "and its arguments resolve against its catalog")
+    (let ((status (mcp:status)))
+      (is (search "t3, this session's: ready" status) "status names it as the session's")
+      (is (null (search "sekrit-token-1" status)) "never an env value")))
+  (is (null (find-symbol "T3/ECHO" :nodecode-mcp)) "no function is generated for it")
+  (is (null (probe-file (mcp::tool-cache-path "t3"))) "and no catalog is kept")
+  (let ((log (mcp::stderr-log-path (mcp::server-spec (mcp-session-server "s-a" "t3")))))
+    (is (search "session-s-a--t3" (namestring log)) "its log carries the session id")
+    (is (probe-file log)))
+  (is (null (search "sekrit-token-1" (princ-to-string (mcp::server-spec (mcp-session-server "s-a" "t3"))))) "a printed spec shows no env value")
+  (in-session ("s-b")
+    (is (signals-error mcp:mcp-unknown-server (mcp:call "t3" "echo" :message "x")) "another session does not reach it")))
+
+(deftest mcp-cell-session-servers-come-before-configured-ones (with-mcp-cell ("probe" (mcp-fixture-entry)))
+  (mcp-wait-ready "probe")
+  (nle:set-session-mcp-servers "s-a" (list (mcp-acp-server "probe")))
+  (in-session ("s-a")
+    (is (equal "token: sekrit-token-1" (mcp:call "probe" "token")) "the session's own of a name wins"))
+  (in-session ("s-b")
+    (is (signals-error mcp:mcp-unknown-tool (mcp:call "probe" "token")) "the configured one elsewhere"))
+  (is (eq :ready (mcp::server-state (mcp-server "probe"))) "which runs on as it was"))
+
+(deftest mcp-cell-session-servers-set-again-and-dropped (with-mcp-cell ())
+  (nle:set-session-mcp-servers "s-a" (list (mcp-acp-server "t3")))
+  (in-session ("s-a") (mcp:call "t3" "echo" :message "up"))
+  (let* ((server (mcp-session-server "s-a" "t3"))
+         (pid (mcp::stdio-transport-pid (mcp::client-transport (mcp::server-client server)))))
+    (nle:set-session-mcp-servers "s-a" (list (mcp-acp-server "t3")))
+    (is (eq server (mcp-session-server "s-a" "t3")) "a server reached the same way is kept")
+    (is (nlk:pid-live-p pid) "and so is its process")
+    (let ((changed (mcp-acp-server "t3")))
+      (setf (gethash "env" changed) (vector (nlk:json-object "name" "FIXTURE_TOKEN" "value" "rotated")))
+      (nle:set-session-mcp-servers "s-a" (list changed)))
+    (is (not (eq server (mcp-session-server "s-a" "t3"))) "a changed one is a new server")
+    (is (await (:timeout 10) (not (nlk:pid-live-p pid))) "the old process is closed")
+    (in-session ("s-a") (is (equal "token: rotated" (mcp:call "t3" "token")) "the new one carries the new env"))
+    (let ((pid (mcp::stdio-transport-pid (mcp::client-transport (mcp::server-client (mcp-session-server "s-a" "t3"))))))
+      (nle:set-session-mcp-servers "s-a" nil)
+      (is (null (mcp::session-servers "s-a")) "NIL drops them")
+      (is (await (:timeout 10) (not (nlk:pid-live-p pid))) "and closes them")
+      (in-session ("s-a") (is (signals-error mcp:mcp-unknown-server (mcp:call "t3" "echo" :message "x")))))))
+
+(deftest mcp-cell-session-servers-refused-and-closed-at-stop (with-mcp-cell ())
+  (nle:set-session-mcp-servers "s-a" (list (mcp-acp-server "t3")
+                                           (nlk:json-object "type" "sse" "name" "old" "url" "http://127.0.0.1:9/sse")
+                                           (mcp-acp-server "t3")))
+  (let ((servers (mcp::session-servers "s-a")))
+    (is (= 3 (length servers)))
+    (is (search "sse is not one this client speaks" (mcp::server-error-text (second servers))) "an SSE server is refused")
+    (is (search "a second session server named t3" (mcp::server-error-text (third servers))) "and a second of one name"))
+  (in-session ("s-a") (mcp:call "t3" "echo" :message "up"))
+  (let ((pid (mcp::stdio-transport-pid (mcp::client-transport (mcp::server-client (mcp-session-server "s-a" "t3"))))))
+    (funcall stop)
+    (setf stop nil)
+    (is (not (nlk:pid-live-p pid)) "stop closes a session's servers")
+    (is (zerop (hash-table-count mcp::*session-servers*)) "and forgets them")
+    (is (not (member 'mcp::session-servers-set nle::*session-mcp-servers-hooks*)) "and gives the hook back")))
+
+(deftest mcp-cell-session-servers-outlive-a-restart-of-the-cell (with-mcp-cell ())
+  ;; A folder restart closes a session's servers; its start holds again what
+  ;; the core still holds, since the client hands them only on a new link.
+  (nle:set-session-mcp-servers "s-r" (list (mcp-acp-server "t3")))
+  (funcall stop)
+  (setf stop (mcp:start-cell (mcp-config)))
+  (is (mcp-session-server "s-r" "t3") "the start holds the session's servers again")
+  (in-session ("s-r")
+    (is (equal "token: sekrit-token-1" (mcp:call "t3" "token")) "and they connect as before"))
+  (nle:set-session-mcp-servers "s-r" nil))
+
+(deftest mcp-cell-session-servers-ride-the-session-s-live-section (with-mcp-cell ())
+  (is (null (mcp-session-section "s-a")) "no servers, no section")
+  (nle:set-session-mcp-servers "s-a" (list (mcp-acp-server "t3" "--instructions" "Ask t3 first.")))
+  (let ((text (mcp-session-section "s-a")))
+    (is (search "(mcp:call \"SERVER\" \"TOOL\" :arg value ...)" text) "the section says how to call one")
+    (is (search "t3: " text) "and names it"))
+  (await (:timeout 15) (eq :ready (mcp::server-state (mcp-session-server "s-a" "t3"))))
+  (in-session ("s-a")
+    (is (search "(mcp:call \"t3\" \"echo\" :message*" (mcp:tools "t3")) "its tools list as calls by name")
+    (is (equal (format nil "t3:~%Ask t3 first.") (mcp:instructions "t3")) "its initialize instructions reach the session")
+    (is (equal (format nil "t3:~%Ask t3 first.") (mcp:instructions)) "and (mcp:instructions) lists it"))
+  (is (search "t3: 11 tools: echo fail late" (mcp-session-section "s-a")) "its tools once listed")
+  (is (search "(mcp:instructions \"t3\")" (mcp-session-section "s-a")) "and points at its instructions")
+  (is (null (mcp-session-section "s-b")) "another session reads none")
+  (in-session ("s-b")
+    (is (null (search "Ask t3 first." (mcp:instructions))) "another session does not read its instructions"))
+  (is (null (search "t3" (or (mcp::primer-text) ""))) "and the manual every session shares never names it"))
+
+(deftest mcp-cell-session-http-server-sends-its-headers-to-its-origin-only (with-mcp-http-fixture (fixture :require-header '("authorization" . "Bearer from-client")))
+  (with-mcp-cell ()
+    (nle:set-session-mcp-servers "s-a" (list (nlk:json-object "type" "http" "name" "web"
+                                                              "url" (format nil "http://127.0.0.1:~d/mcp" (mcp-http-fixture-port fixture))
+                                                              "headers" (vector (nlk:json-object "name" "Authorization"
+                                                                                                 "value" "Bearer from-client")))))
+    (in-session ("s-a")
+      (is (equal "echo: hi" (mcp:call "web" "echo" :message "hi")) "its client's headers reach its server")
+      (is (null (search "from-client" (mcp:status))) "and never a status"))
+    (is (mcp::http-transport-origin-only (mcp::client-transport (mcp::server-client (mcp-session-server "s-a" "web")))) "its transport follows no redirect")))
